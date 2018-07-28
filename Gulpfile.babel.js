@@ -6,7 +6,6 @@ import gulpBatch from "gulp-batch";
 import gulpCSSNano from "gulp-cssnano";
 import gulpImage from "gulp-image";
 import gulpSass from "gulp-sass";
-import gulpSequence  from "gulp-sequence";
 import gulpWatch from "gulp-watch";
 import gulpWebpack  from "webpack-stream";
 import gulpConcat from "gulp-concat";
@@ -122,16 +121,20 @@ gulp.task("dist:noscript", () => {
 });
 
 
-gulp.task("dist:admin:fonts", () => {
+gulp.task("dist:admin:fonts", (done) => {
   gulp.src("warehouse/admin/static/fonts/*.*")
     .pipe(gulp.dest("warehouse/admin/static/dist/fonts"));
+  gulp.src("warehouse/admin/static/webfonts/*.*")
+    .pipe(gulp.dest("warehouse/admin/static/dist/webfonts"));
+
+  done();
 });
 
 
 gulp.task("dist:admin:css", () => {
   let files = [ // Order matters!
     "warehouse/admin/static/css/bootstrap.min.css",
-    "warehouse/admin/static/css/font-awesome.min.css",
+    "warehouse/admin/static/css/fontawesome.min.css",
     "warehouse/admin/static/css/ionicons.min.css",
     "warehouse/admin/static/css/AdminLTE.min.css",
     "warehouse/admin/static/css/skins/skin-purple.min.css",
@@ -172,9 +175,9 @@ gulp.task("dist:css", () => {
 });
 
 
-gulp.task("dist:font-awesome:css", () => {
-  let fABasePath = path.dirname(require.resolve("font-awesome/package.json")); // eslint-disable-line no-undef
-  let fACSSPath = path.resolve(fABasePath, "css", "font-awesome.css");
+gulp.task("dist:fontawesome:css", () => {
+  let fABasePath = path.dirname(require.resolve("@fortawesome/fontawesome-free/package.json")); // eslint-disable-line no-undef
+  let fACSSPath = path.resolve(fABasePath, "css", "*.css");
 
   return gulp.src(fACSSPath)
     .pipe(sourcemaps.init({ loadMaps: true }))
@@ -186,17 +189,16 @@ gulp.task("dist:font-awesome:css", () => {
     .pipe(gulp.dest(path.join(distPath, "css")));
 });
 
-gulp.task("dist:font-awesome:fonts", () => {
-  let fABasePath = path.dirname(require.resolve("font-awesome/package.json")); // eslint-disable-line no-undef
-  let faFontPath = path.resolve(fABasePath, "fonts", "*.*");
+gulp.task("dist:fontawesome:fonts", () => {
+  let fABasePath = path.dirname(require.resolve("@fortawesome/fontawesome-free/package.json")); // eslint-disable-line no-undef
+  let faFontPath = path.resolve(fABasePath, "webfonts", "*.*");
 
   return gulp.src(faFontPath)
-    .pipe(gulp.dest(path.join(distPath, "fonts")));
+    .pipe(gulp.dest(path.join(distPath, "webfonts")));
 });
 
 
-gulp.task("dist:font-awesome",
-  ["dist:font-awesome:css", "dist:font-awesome:fonts"]);
+gulp.task("dist:fontawesome", gulp.parallel("dist:fontawesome:css", "dist:fontawesome:fonts"));
 
 
 gulp.task("dist:images", () => {
@@ -307,48 +309,45 @@ gulp.task("dist:compress:br:text", () => {
 
 gulp.task(
   "dist:compress:br",
-  ["dist:compress:br:generic", "dist:compress:br:text"]
+  gulp.parallel("dist:compress:br:generic", "dist:compress:br:text")
 );
 
 
-gulp.task("dist:compress", ["dist:compress:gz", "dist:compress:br"]);
+gulp.task("dist:compress", gulp.parallel("dist:compress:gz", "dist:compress:br"));
 
 
-gulp.task("dist", (cb) => {
-  return gulpSequence(
-    // Ensure that we have a good clean base to start out with, by blowing away
-    // any previously built files.
-    "clean",
-    // Build all of our static assets.
-    [
-      "dist:font-awesome",
-      "dist:css",
-      "dist:noscript",
-      "dist:js",
-      "dist:admin:fonts",
-      "dist:admin:css",
-      "dist:admin:js",
-      "dist:vendor",
-    ],
-    // We have this here, instead of in the list above even though there is no
-    // ordering dependency so that all of it's output shows up together which
-    // makes it easier to read.
-    "dist:images",
-    // This has to be on it's own, and it has to be one of the last things we do
-    // because otherwise we won't catch all of the files in the revisioning
-    // process.
-    "dist:manifest",
-    // Finally, once we've done everything else, we'll compress everything that
-    // we've gotten.
-    "dist:compress"
-  )(cb);
-});
+gulp.task("clean", () => { return del([distPath, "warehouse/admin/static/dist"]); });
+
+gulp.task("dist", gulp.series(
+  // Ensure that we have a good clean base to start out with, by blowing away
+  // any previously built files.
+  "clean",
+  // Build all of our static assets.
+  gulp.parallel(
+    "dist:fontawesome",
+    "dist:css",
+    "dist:noscript",
+    "dist:js",
+    "dist:admin:fonts",
+    "dist:admin:css",
+    "dist:admin:js",
+    "dist:vendor",
+  ),
+  // We have this here, instead of in the list above even though there is no
+  // ordering dependency so that all of it's output shows up together which
+  // makes it easier to read.
+  "dist:images",
+  // This has to be on it's own, and it has to be one of the last things we do
+  // because otherwise we won't catch all of the files in the revisioning
+  // process.
+  "dist:manifest",
+  // Finally, once we've done everything else, we'll compress everything that
+  // we've gotten.
+  "dist:compress"
+));
 
 
-gulp.task("clean", () => { return del(distPath); });
-
-
-gulp.task("watch", ["dist"], () => {
+gulp.task("watch", gulp.series("dist", () => {
   let watchPaths = [
     path.join(staticPrefix, "**", "*"),
     path.join("!" + distPath, "**", "*"),
@@ -360,7 +359,7 @@ gulp.task("watch", ["dist"], () => {
     watchPaths,
     gulpBatch((_, done) => { gulp.start("dist", done); })
   );
-});
+}));
 
 
-gulp.task("default", ["dist"]);
+gulp.task("default", gulp.series("dist"));

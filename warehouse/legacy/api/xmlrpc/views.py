@@ -20,7 +20,8 @@ from elasticsearch_dsl import Q
 from packaging.utils import canonicalize_name
 from pyramid.view import view_config
 from pyramid_rpc.xmlrpc import (
-    exception_view as _exception_view, xmlrpc_method as _xmlrpc_method
+    exception_view as _exception_view,
+    xmlrpc_method as _xmlrpc_method,
 )
 from sqlalchemy import func, orm, select
 from sqlalchemy.orm.exc import NoResultFound
@@ -28,12 +29,34 @@ from sqlalchemy.orm.exc import NoResultFound
 from warehouse.accounts.models import User
 from warehouse.classifiers.models import Classifier
 from warehouse.packaging.models import (
-    Role, Project, Release, File, JournalEntry, release_classifiers,
+    Role,
+    Project,
+    Release,
+    File,
+    JournalEntry,
+    release_classifiers,
 )
 from warehouse.search.queries import SEARCH_BOOSTS
 
 
-_MAX_MULTICALLS = 20
+def submit_xmlrpc_metrics(method=None):
+    """
+    Submit metrics to DataDog
+    """
+
+    def decorator(f):
+        def wrapped(context, request):
+            request.registry.datadog.increment(
+                "warehouse.xmlrpc.call", tags=[f"rpc_method:{method}"]
+            )
+            with request.registry.datadog.timed(
+                "warehouse.xmlrpc.timing", tags=[f"rpc_method:{method}"]
+            ):
+                return f(context, request)
+
+        return wrapped
+
+    return decorator
 
 
 def xmlrpc_method(**kwargs):
@@ -42,12 +65,16 @@ def xmlrpc_method(**kwargs):
     xmlrpc_method
     """
     # Add some default arguments
-    kwargs.update(require_csrf=False, require_methods=["POST"])
+    kwargs.update(
+        require_csrf=False,
+        require_methods=["POST"],
+        decorator=(submit_xmlrpc_metrics(method=kwargs["method"]),),
+    )
 
     def decorator(f):
-        rpc2 = _xmlrpc_method(endpoint='RPC2', **kwargs)
-        pypi = _xmlrpc_method(endpoint='pypi', **kwargs)
-        pypi_slash = _xmlrpc_method(endpoint='pypi_slash', **kwargs)
+        rpc2 = _xmlrpc_method(endpoint="RPC2", **kwargs)
+        pypi = _xmlrpc_method(endpoint="pypi", **kwargs)
+        pypi_slash = _xmlrpc_method(endpoint="pypi_slash", **kwargs)
         return rpc2(pypi_slash(pypi(f)))
 
     return decorator
@@ -56,24 +83,29 @@ def xmlrpc_method(**kwargs):
 xmlrpc_cache_by_project = functools.partial(
     xmlrpc_method,
     xmlrpc_cache=True,
-    xmlrpc_cache_expires=24 * 60 * 60,  # 24 hours
-    xmlrpc_cache_tag='project/%s',
+    xmlrpc_cache_expires=48 * 60 * 60,  # 48 hours
+    xmlrpc_cache_tag="project/%s",
     xmlrpc_cache_arg_index=0,
     xmlrpc_cache_tag_processor=canonicalize_name,
 )
 
 
-class XMLRPCWrappedError(xmlrpc.server.Fault):
+xmlrpc_cache_all_projects = functools.partial(
+    xmlrpc_method,
+    xmlrpc_cache=True,
+    xmlrpc_cache_expires=1 * 60 * 60,  # 1 hours
+    xmlrpc_cache_tag="all-projects",
+)
 
+
+class XMLRPCWrappedError(xmlrpc.server.Fault):
     def __init__(self, exc):
         self.faultCode = -32500
         self.wrapped_exception = exc
 
     @property
     def faultString(self):  # noqa
-        return "{exc.__class__.__name__}: {exc}".format(
-            exc=self.wrapped_exception,
-        )
+        return "{exc.__class__.__name__}: {exc}".format(exc=self.wrapped_exception)
 
 
 @view_config(route_name="pypi", context=Exception, renderer="xmlrpc")
@@ -97,10 +129,22 @@ def search(request, spec, operator="and"):
     spec = {
         k: [v] if isinstance(v, str) else v
         for k, v in spec.items()
-        if v and k in {
-            "name", "version", "author", "author_email", "maintainer",
-            "maintainer_email", "home_page", "license", "summary",
-            "description", "keywords", "platform", "download_url",
+        if v
+        and k
+        in {
+            "name",
+            "version",
+            "author",
+            "author_email",
+            "maintainer",
+            "maintainer_email",
+            "home_page",
+            "license",
+            "summary",
+            "description",
+            "keywords",
+            "platform",
+            "download_url",
         }
     }
 
@@ -124,16 +168,15 @@ def search(request, spec, operator="and"):
 
     results = query[:100].execute()
 
-    request.registry.datadog.histogram('warehouse.xmlrpc.search.results',
-                                       len(results))
+    request.registry.datadog.histogram("warehouse.xmlrpc.search.results", len(results))
 
     if "version" in spec.keys():
         return [
             {
                 "name": r.name,
-                "summary": r.summary,
+                "summary": getattr(r, "summary", None),
                 "version": v,
-                "_pypi_ordering": False
+                "_pypi_ordering": False,
             }
             for r in results
             for v in r.version
@@ -142,21 +185,21 @@ def search(request, spec, operator="and"):
     return [
         {
             "name": r.name,
-            "summary": r.summary,
+            "summary": getattr(r, "summary", None),
             "version": r.latest_version,
-            "_pypi_ordering": False
+            "_pypi_ordering": False,
         }
         for r in results
     ]
 
 
-@xmlrpc_method(method="list_packages")
+@xmlrpc_cache_all_projects(method="list_packages")
 def list_packages(request):
     names = request.db.query(Project.name).order_by(Project.name).all()
     return [n[0] for n in names]
 
 
-@xmlrpc_method(method="list_packages_with_serial")
+@xmlrpc_cache_all_projects(method="list_packages_with_serial")
 def list_packages_with_serial(request):
     serials = request.db.query(Project.name, Project.last_serial).all()
     return dict((serial[0], serial[1]) for serial in serials)
@@ -167,9 +210,8 @@ def package_hosting_mode(request, package_name):
     try:
         project = (
             request.db.query(Project)
-                      .filter(Project.normalized_name ==
-                              func.normalize_pep426_name(package_name))
-                      .one()
+            .filter(Project.normalized_name == func.normalize_pep426_name(package_name))
+            .one()
         )
     except NoResultFound:
         return None
@@ -181,10 +223,10 @@ def package_hosting_mode(request, package_name):
 def user_packages(request, username):
     roles = (
         request.db.query(Role)
-                  .join(User, Project)
-                  .filter(User.username == username)
-                  .order_by(Role.role_name.desc(), Project.name)
-                  .all()
+        .join(User, Project)
+        .filter(User.username == username)
+        .order_by(Role.role_name.desc(), Project.name)
+        .all()
     )
     return [(r.role_name, r.project.name) for r in roles]
 
@@ -192,7 +234,7 @@ def user_packages(request, username):
 @xmlrpc_method(method="top_packages")
 def top_packages(request, num=None):
     raise XMLRPCWrappedError(
-        RuntimeError("This API has been removed. Please Use BigQuery instead.")
+        RuntimeError("This API has been removed. Use BigQuery instead.")
     )
 
 
@@ -201,9 +243,8 @@ def package_releases(request, package_name, show_hidden=False):
     try:
         project = (
             request.db.query(Project)
-                      .filter(Project.normalized_name ==
-                              func.normalize_pep426_name(package_name))
-                      .one()
+            .filter(Project.normalized_name == func.normalize_pep426_name(package_name))
+            .one()
         )
     except NoResultFound:
         return []
@@ -227,10 +268,12 @@ def package_data(request, package_name, version):
     domain = settings.get("warehouse.domain", request.domain)
     raise XMLRPCWrappedError(
         RuntimeError(
-            ("This API has been deprecated. Use "
-             f"https://{domain}/{package_name}/{version}/json "
-             "instead. The XMLRPC method release_data can be used in the "
-             "interim, but will be deprecated in the future.")
+            (
+                "This API has been deprecated. Use "
+                f"https://{domain}/{package_name}/{version}/json "
+                "instead. The XMLRPC method release_data can be used in the "
+                "interim, but will be deprecated in the future."
+            )
         )
     )
 
@@ -240,12 +283,13 @@ def release_data(request, package_name, version):
     try:
         release = (
             request.db.query(Release)
-                      .options(orm.undefer("description"))
-                      .join(Project)
-                      .filter((Project.normalized_name ==
-                               func.normalize_pep426_name(package_name)) &
-                              (Release.version == version))
-                      .one()
+            .options(orm.undefer("description"))
+            .join(Project)
+            .filter(
+                (Project.normalized_name == func.normalize_pep426_name(package_name))
+                & (Release.version == version)
+            )
+            .one()
         )
     except NoResultFound:
         return {}
@@ -256,13 +300,10 @@ def release_data(request, package_name, version):
         "stable_version": release.project.stable_version,
         "bugtrack_url": release.project.bugtrack_url,
         "package_url": request.route_url(
-            "packaging.project",
-            name=release.project.name,
+            "packaging.project", name=release.project.name
         ),
         "release_url": request.route_url(
-            "packaging.release",
-            name=release.project.name,
-            version=release.version,
+            "packaging.release", name=release.project.name, version=release.version
         ),
         "docs_url": release.project.documentation_url,
         "home_page": release.home_page,
@@ -288,11 +329,7 @@ def release_data(request, package_name, version):
         "requires_external": list(release.requires_external),
         "_pypi_ordering": release._pypi_ordering,
         "_pypi_hidden": release._pypi_hidden,
-        "downloads": {
-            "last_day": -1,
-            "last_week": -1,
-            "last_month": -1,
-        },
+        "downloads": {"last_day": -1, "last_week": -1, "last_month": -1},
         "cheesecake_code_kwalitee_id": None,
         "cheesecake_documentation_id": None,
         "cheesecake_installability_id": None,
@@ -305,10 +342,12 @@ def package_urls(request, package_name, version):
     domain = settings.get("warehouse.domain", request.domain)
     raise XMLRPCWrappedError(
         RuntimeError(
-            ("This API has been deprecated. Use "
-             f"https://{domain}/{package_name}/{version}/json "
-             "instead. The XMLRPC method release_urls can be used in the "
-             "interim, but will be deprecated in the future.")
+            (
+                "This API has been deprecated. Use "
+                f"https://{domain}/{package_name}/{version}/json "
+                "instead. The XMLRPC method release_urls can be used in the "
+                "interim, but will be deprecated in the future."
+            )
         )
     )
 
@@ -317,11 +356,12 @@ def package_urls(request, package_name, version):
 def release_urls(request, package_name, version):
     files = (
         request.db.query(File)
-                  .join(Release, Project)
-                  .filter((Project.normalized_name ==
-                           func.normalize_pep426_name(package_name)) &
-                          (Release.version == version))
-                  .all()
+        .join(Release, Project)
+        .filter(
+            (Project.normalized_name == func.normalize_pep426_name(package_name))
+            & (Release.version == version)
+        )
+        .all()
     )
 
     return [
@@ -332,10 +372,7 @@ def release_urls(request, package_name, version):
             "size": f.size,
             "md5_digest": f.md5_digest,
             "sha256_digest": f.sha256_digest,
-            "digests": {
-                "md5": f.md5_digest,
-                "sha256": f.sha256_digest,
-            },
+            "digests": {"md5": f.md5_digest, "sha256": f.sha256_digest},
             "has_sig": f.has_signature,
             "upload_time": f.upload_time.isoformat() + "Z",
             "comment_text": f.comment_text,
@@ -353,11 +390,10 @@ def release_urls(request, package_name, version):
 def package_roles(request, package_name):
     roles = (
         request.db.query(Role)
-                  .join(User, Project)
-                  .filter(Project.normalized_name ==
-                          func.normalize_pep426_name(package_name))
-                  .order_by(Role.role_name.desc(), User.username)
-                  .all()
+        .join(User, Project)
+        .filter(Project.normalized_name == func.normalize_pep426_name(package_name))
+        .order_by(Role.role_name.desc(), User.username)
+        .all()
     )
     return [(r.role_name, r.user.username) for r in roles]
 
@@ -371,20 +407,16 @@ def changelog_last_serial(request):
 def changelog_since_serial(request, serial):
     entries = (
         request.db.query(JournalEntry)
-                  .filter(JournalEntry.id > serial)
-                  .order_by(JournalEntry.id)
-                  .limit(50000)
+        .filter(JournalEntry.id > serial)
+        .order_by(JournalEntry.id)
+        .limit(50000)
     )
 
     return [
         (
             e.name,
             e.version,
-            int(
-                e.submitted_date
-                 .replace(tzinfo=datetime.timezone.utc)
-                 .timestamp()
-            ),
+            int(e.submitted_date.replace(tzinfo=datetime.timezone.utc).timestamp()),
             e.action,
             e.id,
         )
@@ -397,20 +429,16 @@ def changelog(request, since, with_ids=False):
     since = datetime.datetime.utcfromtimestamp(since)
     entries = (
         request.db.query(JournalEntry)
-                  .filter(JournalEntry.submitted_date > since)
-                  .order_by(JournalEntry.id)
-                  .limit(50000)
+        .filter(JournalEntry.submitted_date > since)
+        .order_by(JournalEntry.id)
+        .limit(50000)
     )
 
     results = (
         (
             e.name,
             e.version,
-            int(
-                e.submitted_date
-                 .replace(tzinfo=datetime.timezone.utc)
-                 .timestamp()
-            ),
+            int(e.submitted_date.replace(tzinfo=datetime.timezone.utc).timestamp()),
             e.action,
             e.id,
         )
@@ -427,8 +455,8 @@ def changelog(request, since, with_ids=False):
 def browse(request, classifiers):
     classifiers_q = (
         request.db.query(Classifier)
-               .filter(Classifier.classifier.in_(classifiers))
-               .subquery()
+        .filter(Classifier.classifier.in_(classifiers))
+        .subquery()
     )
 
     release_classifiers_q = (
@@ -439,23 +467,25 @@ def browse(request, classifiers):
 
     releases = (
         request.db.query(Release.name, Release.version)
-                  .join(release_classifiers_q,
-                        (Release.name == release_classifiers_q.c.name) &
-                        (Release.version == release_classifiers_q.c.version))
-                  .group_by(Release.name, Release.version)
-                  .having(func.count() == len(classifiers))
-                  .order_by(Release.name, Release.version)
-                  .all()
+        .join(
+            release_classifiers_q,
+            (Release.name == release_classifiers_q.c.name)
+            & (Release.version == release_classifiers_q.c.version),
+        )
+        .group_by(Release.name, Release.version)
+        .having(func.count() == len(classifiers))
+        .order_by(Release.name, Release.version)
+        .all()
     )
 
     return [(r.name, r.version) for r in releases]
 
 
-@xmlrpc_method(method='system.multicall')
+@xmlrpc_method(method="system.multicall")
 def multicall(request, args):
     raise XMLRPCWrappedError(
         ValueError(
-            'MultiCall requests have been deprecated, use individual '
-            'requests instead.'
+            "MultiCall requests have been deprecated, use individual "
+            "requests instead."
         )
     )

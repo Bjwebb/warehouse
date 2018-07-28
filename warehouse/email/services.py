@@ -11,7 +11,9 @@
 # limitations under the License.
 
 from email.headerregistry import Address
-from email.utils import parseaddr
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import parseaddr, formataddr
 
 from pyramid_mailer import get_mailer
 from pyramid_mailer.message import Message
@@ -28,7 +30,6 @@ def _format_sender(sitename, sender):
 
 @implementer(IEmailSender)
 class SMTPEmailSender:
-
     def __init__(self, mailer, sender=None):
         self.mailer = mailer
         self.sender = sender
@@ -36,23 +37,18 @@ class SMTPEmailSender:
     @classmethod
     def create_service(cls, context, request):
         sitename = request.registry.settings["site.name"]
-        sender = _format_sender(sitename,
-                                request.registry.settings.get("mail.sender"))
+        sender = _format_sender(sitename, request.registry.settings.get("mail.sender"))
         return cls(get_mailer(request), sender=sender)
 
     def send(self, subject, body, *, recipient):
         message = Message(
-            subject=subject,
-            body=body,
-            recipients=[recipient],
-            sender=self.sender,
+            subject=subject, body=body, recipients=[recipient], sender=self.sender
         )
         self.mailer.send_immediately(message)
 
 
 @implementer(IEmailSender)
 class SESEmailSender:
-
     def __init__(self, client, *, sender=None, db):
         self._client = client
         self._sender = sender
@@ -61,30 +57,38 @@ class SESEmailSender:
     @classmethod
     def create_service(cls, context, request):
         sitename = request.registry.settings["site.name"]
-        sender = _format_sender(sitename,
-                                request.registry.settings.get("mail.sender"))
+        sender = _format_sender(sitename, request.registry.settings.get("mail.sender"))
 
         aws_session = request.find_service(name="aws.session")
 
         return cls(
             aws_session.client(
-                "ses",
-                region_name=request.registry.settings.get("mail.region"),
+                "ses", region_name=request.registry.settings.get("mail.region")
             ),
             sender=sender,
             db=request.db,
         )
 
     def send(self, subject, body, *, recipient):
-        resp = self._client.send_email(
+        message = MIMEMultipart("mixed")
+        message["Subject"] = subject
+        message["From"] = self._sender
+
+        # The following is necessary to support friendly names with Unicode characters,
+        # otherwise the entire value will get encoded and will not be accepted by SES:
+        #
+        #   >>> parseaddr("Fööbar <foo@bar.com>")
+        #   ('Fööbar', 'foo@bar.com')
+        #   >>> formataddr(_)
+        #   '=?utf-8?b?RsO2w7ZiYXI=?= <foo@bar.com>'
+        message["To"] = formataddr(parseaddr(recipient))
+
+        message.attach(MIMEText(body, "plain", "utf-8"))
+
+        resp = self._client.send_raw_email(
             Source=self._sender,
-            Destination={"ToAddresses": [recipient]},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {
-                    "Text": {"Data": body, "Charset": "UTF-8"},
-                },
-            },
+            Destinations=[recipient],
+            RawMessage={"Data": message.as_string()},
         )
 
         self._db.add(
@@ -93,5 +97,5 @@ class SESEmailSender:
                 from_=parseaddr(self._sender)[1],
                 to=parseaddr(recipient)[1],
                 subject=subject,
-            ),
+            )
         )
